@@ -1,0 +1,46 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# config for the rollout (only for resource isolation)
+rollout:
+  # Number of nodes used in the rollout
+  nnodes: 1
+  # Number of GPUs per node
+  n_gpus_per_node: 8
+
+# ============================================================
+# 多步滞后训练配置
+# ============================================================
+actor_rollout_ref:
+  rollout:
+    # ========== 模式选择 ==========
+    # adaptive_sync_frequency: 是否启用自适应同步频率
+    #   - true:  启用自适应模式，根据训练稳定性动态调整 sync_frequency
+    #   - false: 使用固定的 sync_frequency（方案2）
+    adaptive_sync_frequency: false
+
+    # ========== 固定模式参数（当 adaptive_sync_frequency=false 时生效）==========
+    # 权重同步频率（默认1表示每步都同步）
+    # sync_frequency: 2  表示每2步同步一次权重（rollout模型会滞后1-2步）
+    # sync_frequency: 3  表示每3步同步一次权重（rollout模型会滞后1-3步）
+    # sync_frequency: 5  表示每5步同步一次权重（rollout模型会滞后1-5步）
+    sync_frequency: 2
+
+    # ========== 自适应模式参数（当 adaptive_sync_frequency=true 时生效）==========
+    # 初始同步频率
+    init_sync_frequency: 3
+
+    # 同步频率范围
+    min_sync_frequency: 1
+    max_sync_frequency: 10
+
+    # 调整阈值（基于 actor/pg_clipfrac 指标）
+    # stable_threshold: 当平均 clip_ratio < 此值时，认为训练稳定，增大 sync_frequency
+    # unstable_threshold: 当平均 clip_ratio > 此值时，认为训练不稳定，减小 sync_frequency
+    stable_threshold: 0.0007
+    unstable_threshold: 0.0012

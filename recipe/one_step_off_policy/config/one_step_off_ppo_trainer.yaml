@@ -1,0 +1,34 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# config for the rollout (only for resource isolation)
+rollout:
+  # Number of nodes used in the rollout
+  nnodes: 1
+  # Number of GPUs per node
+  n_gpus_per_node: 8
+
+# To adapt to the current logic of AgentLoopManager
+actor_rollout_ref:
+  rollout:
+    # Must be turned off! Otherwise, Parameter synchronization cannot be performed.
+    free_cache_engine: False
+    # Must be enabled! Otherwise, log_probs cannot be calculated.
+    calculate_log_probs: True
+    # ========== 固定模式参数（当 adaptive_sync_frequency=false 时生效）==========
+    # 权重同步频率（默认1表示每步都同步）
+    # sync_frequency: 2  表示每2步同步一次权重（rollout模型会滞后1-2步）
+    # sync_frequency: 3  表示每3步同步一次权重（rollout模型会滞后1-3步）
+    # sync_frequency: 5  表示每5步同步一次权重（rollout模型会滞后1-5步）
+    sync_frequency: 2
+
+# Only then will the use of log probs be correct.
+# And it can be used in conjunction with other rollout_correction algorithms.
+algorithm:
+  rollout_correction:
+    bypass_mode: True
