@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import asyncio
 import uuid
+from collections import defaultdict
 from pprint import pprint
 
 import numpy as np
@@ -126,6 +127,13 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             )
         # Count completed actor updates so rollout can adopt newer weights every N updates.
         self.actor_update_steps = 0
+
+        # ── Rollout version & staleness tracking ──
+        # Tracks the actor_update_steps value at the time rollout weights were last synced.
+        # Used to compute how stale each batch's rollout data is relative to the current actor.
+        self.rollout_weight_version = 0
+        # Cumulative counter: staleness_value -> number_of_batches
+        self.staleness_counter: dict[int, int] = defaultdict(int)
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
@@ -323,6 +331,8 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             return False
 
         self.sync_rollout_weights()
+        # Record the actor version that was synced to rollout
+        self.rollout_weight_version = self.actor_update_steps
         await self.async_rollout_manager.clear_kv_cache()
         return True
 
@@ -367,6 +377,8 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         # pass global_steps to trace
         gen_batch.meta_info["global_steps"] = self.global_steps
+        # Record which actor version the rollout model is using for this generation
+        gen_batch.meta_info["rollout_weight_version"] = self.rollout_weight_version
         gen_batch_output = gen_batch.repeat(repeat_times=n_rollouts, interleave=True)
 
         # async generation
@@ -376,6 +388,8 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         # repeat to align with repeated responses in rollout
         batch = batch.repeat(repeat_times=n_rollouts, interleave=True)
         batch = batch.union(gen_batch_output)
+        # Propagate rollout_weight_version to the final batch for staleness tracking
+        batch.meta_info["rollout_weight_version"] = self.rollout_weight_version
 
         if "response_mask" not in batch.batch.keys():
             batch.batch["response_mask"] = compute_response_mask(batch)
@@ -786,6 +800,12 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             steps_duration = timing_raw["step"]
             self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
+            # ── staleness distribution tracking ──
+            batch_rollout_version = batch.meta_info.get("rollout_weight_version", 0)
+            staleness = self.actor_update_steps - batch_rollout_version
+            self.staleness_counter[staleness] += 1
+            total_batches = sum(self.staleness_counter.values())
+
             # training metrics
             metrics.update(
                 {
@@ -793,8 +813,14 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                     "training/epoch": epoch,
                     "rollout/sync_frequency": self.sync_frequency,
                     "rollout/actor_update_steps": self.actor_update_steps,
+                    "rollout/rollout_weight_version": batch_rollout_version,
+                    "rollout/staleness": staleness,
                 }
             )
+            # Log per-staleness-level counts and ratios
+            for s_val, s_count in sorted(self.staleness_counter.items()):
+                metrics[f"rollout/staleness_dist/count_lag{s_val}"] = s_count
+                metrics[f"rollout/staleness_dist/ratio_lag{s_val}"] = s_count / total_batches
             # collect metrics
             metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
@@ -864,6 +890,14 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             _lines.append(f"  GPU mem reserved: {metrics.get('perf/max_memory_reserved_gb', -1):.2f} GB")
             _lines.append(f"  CPU mem (RSS):    {_cpu_mem:.2f} GB")
             _lines.append(f"{'─' * 80}")
+            _lines.append(f"  STALENESS (rollout weight lag):")
+            _lines.append(f"{'─' * 80}")
+            _lines.append(f"  This batch:       lag={staleness} (rollout_v={batch_rollout_version}, actor_v={self.actor_update_steps})")
+            _lines.append(f"  Cumulative distribution:")
+            for s_val, s_count in sorted(self.staleness_counter.items()):
+                _bar = '█' * int(s_count / total_batches * 30)
+                _lines.append(f"    lag={s_val}:  {s_count:>5d}  ({s_count/total_batches*100:5.1f}%)  {_bar}")
+            _lines.append(f"{'─' * 80}")
             _lines.append(f"  TIMING BREAKDOWN (seconds):")
             _lines.append(f"{'─' * 80}")
             _lines.append(f"  {'Phase':<30s} {'Time (s)':>10s} {'% of step':>10s}")
@@ -905,3 +939,4 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             if hasattr(self.train_dataset, "on_batch_end"):
                 # The dataset may be changed after each training batch
                 self.train_dataset.on_batch_end(batch=batch)
+                
